@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  spark-comfyui.sh — ComfyUI on NVIDIA DGX Spark (GB10 Grace Blackwell)
-#  Version 2026.10.10 | License: MIT
+#  Version 2026.10.10.1 | License: MIT
 # =============================================================================
 #  Runs ComfyUI in a hardened container tuned for the Spark's aarch64 CPU,
 #  sm_121 GPU and 128 GB unified memory. One script for the whole lifecycle;
@@ -139,7 +139,7 @@ set -euo pipefail
 # Date versioning (CalVer): YYYY.MM.DD, with .N appended for a second
 # behavior-changing release on the same day. Bumped in the same push as any
 # behavior change (pushing to main IS releasing); docs-only pushes don't bump.
-VERSION="2026.10.10"
+VERSION="2026.10.10.1"
 
 # ----------------------------- Configuration --------------------------------
 # Everything is self-contained under the directory this script lives in, so
@@ -1816,6 +1816,10 @@ the calling uid, and root would write root-owned files into your content"
     --user "$(id -u):$(id -g)"
     --group-add 0
     --gpus all
+    # A tiny init as PID 1. Without it the entrypoint execs python as PID 1,
+    # the kernel drops SIGTERM for a PID 1 with no handler, and every 'stop'
+    # waited out docker's 10s grace and ended in SIGKILL (exit 137).
+    --init
     --shm-size "$SHM_SIZE"
     --cap-drop ALL
     --security-opt no-new-privileges

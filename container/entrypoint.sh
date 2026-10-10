@@ -323,22 +323,45 @@ else
   rm -f "$marker"
   req_names=()
   pip_args=()
+  req_use=()
+  ort_nodes=()
+  # A bare 'onnxruntime' line is the CPU dist, which the image's GPU wheel
+  # (dist name onnxruntime-gpu) never satisfies. Installed as written it
+  # shadowed the GPU wheel on EVERY start and ensure_onnx_gpu then had to
+  # repair it (field-measured 2026-10-10 with comfyui-easy-use). Such files
+  # go in as a filtered copy under /tmp, same end state as the repair and
+  # ensure_onnx_gpu below stays the live gate. A file with its own -r/-c
+  # include is left alone, since a copy would break its relative paths; a
+  # transitive onnxruntime is still the guard's job.
+  ort_re='^[[:space:]]*onnxruntime[[:space:]]*([<>=!~;[]|$)'
+  mkdir -p /tmp/spark-reqs
   for req in "${req_files[@]}"; do
-    req_names+=("$(basename "$(dirname "$req")")")
-    pip_args+=(-r "$req")
+    node="$(basename "$(dirname "$req")")"
+    req_names+=("$node")
+    if grep -qiE "$ort_re" "$req" \
+       && ! grep -qE '^[[:space:]]*(-r|-c|--requirement|--constraint)' "$req"; then
+      grep -viE "$ort_re" "$req" > "/tmp/spark-reqs/$node.txt" || true
+      req_use+=("/tmp/spark-reqs/$node.txt")
+      ort_nodes+=("$node")
+    else
+      req_use+=("$req")
+    fi
+    pip_args+=(-r "${req_use[-1]}")
   done
   req_names_txt="$(printf '%s, ' "${req_names[@]}")"
   info "installing requirements for ${#req_files[@]} custom node(s) (via $INSTALLER)"
   info "  ${req_names_txt%, }"
+  (( ${#ort_nodes[@]} == 0 )) \
+    || info "  CPU onnxruntime skipped for: ${ort_nodes[*]} (the image's GPU wheel serves it)"
   if py_install "${pip_args[@]}"; then
     sha256sum "${req_files[@]}" > "$marker"
   else
     warn "combined install failed — retrying per node to isolate it"
     req_fail=0
-    for req in "${req_files[@]}"; do
-      node="$(basename "$(dirname "$req")")"
+    for i in "${!req_files[@]}"; do
+      node="${req_names[$i]}"
       info "custom node $node: installing requirements"
-      py_install -r "$req" \
+      py_install -r "${req_use[$i]}" \
         || { warn "installing requirements for custom node $node failed — the node may not load"; req_fail=1; }
     done
     # No marker after a failure: every start retries until the set heals.
