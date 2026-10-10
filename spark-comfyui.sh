@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  spark-comfyui.sh — ComfyUI on NVIDIA DGX Spark (GB10 Grace Blackwell)
-#  Version 2026.09.05.2 | License: MIT
+#  Version 2026.10.10 | License: MIT
 # =============================================================================
 #  Runs ComfyUI in a hardened container tuned for the Spark's aarch64 CPU,
 #  sm_121 GPU and 128 GB unified memory. One script for the whole lifecycle;
@@ -21,9 +21,11 @@
 #                              gates, installs any Comfy Registry nodes
 #                              listed in comfyui-nodes.list, and installs
 #                              custom-node requirements.
-#    service [--disable]       Same, detached with a docker restart policy:
-#                              survives crashes and reboots. --disable
-#                              removes it.
+#    service [args] | --disable
+#                              Same, detached with a docker restart policy:
+#                              survives crashes and reboots. Extra args pass
+#                              to main.py and stay until the service is
+#                              recreated. --disable removes it.
 #    stop                      Stop ComfyUI (container, service or a stray
 #                              process).
 #    update [--torch|--rollback|--keep[=NAME]]
@@ -137,7 +139,7 @@ set -euo pipefail
 # Date versioning (CalVer): YYYY.MM.DD, with .N appended for a second
 # behavior-changing release on the same day. Bumped in the same push as any
 # behavior change (pushing to main IS releasing); docs-only pushes don't bump.
-VERSION="2026.09.05.2"
+VERSION="2026.10.10"
 
 # ----------------------------- Configuration --------------------------------
 # Everything is self-contained under the directory this script lives in, so
@@ -1092,6 +1094,13 @@ cmd_status() {
       esac
     fi
     echo "  ComfyUI RUNNING (pid $pid$where) -> $(_published_url)"
+    # A service keeps its args across reboots, so this is the only place a
+    # flag passed weeks ago is visible. Quiet when there are none.
+    if [[ -n "$where" ]]; then
+      local cargs
+      cargs="$(docker inspect -f '{{join .Args " "}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+      [[ -z "$cargs" ]] || echo "  extra args: $cargs"
+    fi
     pgrep -af "main.py --listen" | grep -q "use-sage-attention" \
       && echo "  attention: SageAttention" || echo "  attention: PyTorch SDPA"
   else
@@ -1701,15 +1710,25 @@ _orphan_dangling() {
   return 0
 }
 
+# The builder our cache actually lives in. 'docker build' always uses the
+# current context's default builder (named after the context) unless
+# BUILDX_BUILDER says otherwise, while 'buildx du' and 'builder prune' follow
+# whatever 'docker buildx use' last selected. On 2026-10-10 that was another
+# project's stopped docker-container builder: du failed, which took doctor,
+# prune and the tail of update down under set -e, and every trim had been
+# aimed at the wrong cache while ours grew to 209 GB.
+_builder() { echo "${BUILDX_BUILDER:-$(docker context show 2>/dev/null || echo default)}"; }
+
 # Reclaimable BuildKit cache, in GB (integer, 0 when buildx is unavailable).
+# The trailing '|| true' is load-bearing, same lesson as _orphan_tags.
 _build_cache_gb() {
-  docker buildx du 2>/dev/null \
+  docker buildx du --builder "$(_builder)" 2>/dev/null \
     | awk '/^Reclaimable:/ {v=$2
         if (v ~ /GB$/) {sub(/GB$/,"",v); printf "%d", v}
         else if (v ~ /TB$/) {sub(/TB$/,"",v); printf "%d", v*1024}
         else print 0
         found=1}
-      END {if (!found) print 0}'
+      END {if (!found) print 0}' || true
 }
 
 # Trim the build cache to its age and size limits (see the
@@ -1737,7 +1756,7 @@ prune_build_cache() {
   # where every layer keeps getting re-used.
   if [[ "$CACHE_KEEP_DAYS" =~ ^[0-9]+$ ]]; then
     (( CACHE_KEEP_DAYS > 0 )) \
-      && { docker builder prune -f --filter "until=$((CACHE_KEEP_DAYS * 24))h" >/dev/null 2>&1 || true; }
+      && { docker builder prune -f --builder "$(_builder)" --filter "until=$((CACHE_KEEP_DAYS * 24))h" >/dev/null 2>&1 || true; }
   else
     warn "CACHE_KEEP_DAYS is not a number — skipping the age pass"
   fi
@@ -1747,7 +1766,7 @@ prune_build_cache() {
   # last.
   if [[ "$CACHE_MAX_GB" =~ ^[0-9]+$ ]]; then
     (( CACHE_MAX_GB > 0 )) \
-      && { docker builder prune -f --max-used-space "$((CACHE_MAX_GB * 1024 * 1024 * 1024))" >/dev/null 2>&1 || true; }
+      && { docker builder prune -f --builder "$(_builder)" --max-used-space "$((CACHE_MAX_GB * 1024 * 1024 * 1024))" >/dev/null 2>&1 || true; }
   else
     warn "CACHE_MAX_GB is not a number — skipping the size pass"
   fi
@@ -1915,8 +1934,11 @@ cmd_service() {
     fi
     return 0
   fi
-  [[ -z "${1:-}" ]] || die "Unknown container service option: $1 (valid: --disable)"
+  # Everything else passes to main.py, the same contract as 'run'. Docker
+  # stores the args in the container config, so the restart policy keeps them
+  # across crashes and reboots until the service is recreated.
   if [[ -n "$(docker ps -q -f "name=^${CONTAINER_NAME}$")" ]]; then
+    (( $# == 0 )) || die "container $CONTAINER_NAME is already running — stop it first so the new args take effect: $0 stop"
     info "container $CONTAINER_NAME is already running ($0 stop to stop it)"
     return 0
   fi
@@ -1927,8 +1949,9 @@ cmd_service() {
   _container_run_args
   log "Starting containerized ComfyUI as a service (docker restart policy)"
   docker run -d --restart unless-stopped "${CRUN_ARGS[@]}" \
-    "$CONTAINER_IMAGE:latest" >/dev/null
+    "$CONTAINER_IMAGE:latest" "$@" >/dev/null
   echo "  Serving on $(_ui_url); survives crashes and reboots."
+  (( $# == 0 )) || echo "  Extra args: $* (kept until the service is recreated)"
   echo "  Health:  docker ps shows 'healthy' once it is actually serving"
   echo "  Logs:    docker logs -f $CONTAINER_NAME"
   echo "  Stop:    $0 stop   (docker restarts it on next boot)"

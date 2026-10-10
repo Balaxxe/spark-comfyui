@@ -221,6 +221,14 @@ ENV INSTALL_DIR=/opt/ComfyUI
 ENV VENV_DIR=/opt/comfyui-env
 RUN bash /opt/spark/build-mods.sh
 
+# The exact torch trio this image shipped with, for ensure_torch_cuda's repair
+# at start. Read from the installed metadata, not the build args: after
+# 'update --torch' those args are empty, and the full version carries the local
+# tag, which matters because a CPU wheel 2.14.0+cpu satisfies a bare ==2.14.0.
+RUN python -c 'import importlib.metadata as m; \
+print("\n".join(f"{p}=={m.version(p)}" for p in ("torch", "torchvision", "torchaudio")))' \
+      > /opt/spark/torch-pins.txt
+
 # Group 0 rights over everything the runtime stage carries. The container runs
 # as the CALLER's uid, which is unknown at build time, so an arbitrary uid must
 # still be able to write the venv (the entrypoint pip-installs custom-node

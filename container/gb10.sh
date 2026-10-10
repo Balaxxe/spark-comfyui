@@ -216,14 +216,24 @@ PY
 # contract for anything: no MOD_DIR, no supporting files, and mod_apply had no
 # caller in any runner. It is a function here, next to the guard its own
 # comments already cited as the model.
+#
+# The repair reinstalls the exact versions the image was built with, recorded
+# in torch-pins.txt by the Dockerfile. Until 2026.10.10 it passed bare names,
+# which installed the NEWEST torch on the index rather than the pinned one and
+# would then fail the SageAttention gate on the ABI change.
 ensure_torch_cuda() {
-  local info
+  local info pins=/opt/spark/torch-pins.txt
   if info="$(torch_cuda_ok)"; then
     echo "torch: OK — $info"
     return 0
   fi
   warn "torch lost CUDA 13 support — reinstalling cu130 wheels"
-  pip install --force-reinstall torch torchvision torchaudio --index-url "$TORCH_INDEX"
+  if [[ -f "$pins" ]]; then
+    pip install --force-reinstall -r "$pins" --index-url "$TORCH_INDEX"
+  else
+    warn "no $pins in this image — reinstalling the newest torch, which may not match SageAttention"
+    pip install --force-reinstall torch torchvision torchaudio --index-url "$TORCH_INDEX"
+  fi
   if info="$(torch_cuda_ok)"; then
     echo "torch: OK — $info (repaired)"
     return 0
